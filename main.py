@@ -1,11 +1,17 @@
-# main.py
-
 import os
 import logging
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
+import requests
+from fastapi.responses import PlainTextResponse
+
+
+# ─── LLM class import ────────────────────────────────────────────────────
+from langchain_openai import ChatOpenAI
+
 from langgraph.prebuilt import create_react_agent
+from langgraph_supervisor import create_supervisor
 
 # ─── Logging ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -14,56 +20,104 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ─── Load env & define tools ─────────────────────────────────────────────
-load_dotenv()
+# ─── Load environment variables ──────────────────────────────────────────
+load_dotenv()  # expects OPENAI_API_KEY, GOOGLE_SEARCH_API_KEY, GOOGLE_SEARCH_ENGINE_ID
 
+# ─── Instantiate the LLM ─────────────────────────────────────────────────
+llm = ChatOpenAI(
+    model_name="gpt-3.5-turbo",
+    streaming=True
+)
+
+# ─── Define Python tools ─────────────────────────────────────────────────
 def add(a: float, b: float) -> float:
-    """Add two numbers and return the result."""
+    """Add two numbers and return their sum."""
     return a + b
 
 def multiply(a: float, b: float) -> float:
-    """Multiply two numbers and return the product."""
+    """Multiply two numbers and return their product."""
     return a * b
 
+def search_and_fetch(query: str) -> str:
+    """
+    Uses Google Custom Search JSON API to fetch top-3 snippets for `query`.
+    Returns them joined by two newlines, or an error message.
+    """
+    try:
+        resp = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={
+                "key": os.getenv("GOOGLE_SEARCH_API_KEY"),
+                "cx":  os.getenv("GOOGLE_SEARCH_ENGINE_ID"),
+                "q":   query,
+                "num": 3
+            },
+            timeout=5
+        )
+        resp.raise_for_status()
+        items = resp.json().get("items", [])
+        if not items:
+            return "No results found."
+        return "\n\n".join(item["snippet"] for item in items)
+    except Exception as e:
+        return f"Search error: {e}"
+
+# ─── Build the REACT agents ───────────────────────────────────────────────
 math_expert = create_react_agent(
-    model="openai:gpt-4o",
+    model=llm,
+    name="math_expert",
     tools=[add, multiply],
-    prompt="You are **math_expert**. You ONLY may call `add(a,b)` and `multiply(a,b)`. If something is not related to adding or mulitplying then you should say 'I cannot do that'. If you can use add or multiply answer with this before your answer: 'Math_expert"
+    prompt=(
+        "You are **math_expert**. You may *only* call `add(a,b)` and `multiply(a,b)`.\n"
+        "If it’s not addition or multiplication, respond: “I cannot do that.”\n"
+        "Prefix your answer with “Math_expert: ” when you do call a tool."
+    )
 )
 
+search_expert = create_react_agent(
+    model=llm,
+    name="search_expert",
+    tools=[search_and_fetch],
+    prompt=(
+        "You are **search_expert**, an expert web researcher.\n"
+        "• ALWAYS call `search_and_fetch(query)` to look something up on Google.\n"
+        "• Summarize only from that output.\n"
+        "• Prefix your answer with “search_expert: ” when you respond."
+    )
+)
+
+
+# ─── Supervisor that routes to the right expert ─────────────────────────
+workflow = create_supervisor(
+    agents=[math_expert, search_expert],
+    model=llm,
+    prompt=(
+        "You are a team supervisor:\n"
+        "• math_expert handles all arithmetic.\n"
+        "• search_expert handles everything else via search_and_fetch().\n"
+        "Route each user request appropriately."
+    )
+)
+
+app_workflow = workflow.compile()
+
+# ─── FastAPI setup ───────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
 
 app = FastAPI()
 
-@app.post("/chat")
-async def chat(req: ChatRequest):
+@app.post("/chat", response_class=PlainTextResponse)
+def chat(req: ChatRequest) -> str:
     inputs = {"messages": [{"role": "user", "content": req.message}]}
-
-    result = ""
-    for update in math_expert.stream(inputs, stream_mode="updates"):
-        logger.info(f"Raw agent update: {update!r}")
-
-        # 1) tool outputs
-        tools_block = update.get("tools", {})
-        for tm in tools_block.get("messages", []):
-            # tm may be a ToolMessage object with .content
-            piece = getattr(tm, "content", None) or tm.get("content", "")
-            logger.info(f" → tool content: {piece!r}")
-            result += piece
-
-        # 2) agent messages
-        agent_block = update.get("agent", {})
-        for am in agent_block.get("messages", []):
-            # am is likely an AIMessage with .content
-            piece = getattr(am, "content", "")
-            logger.info(f" → agent content: {piece!r}")
-            result += piece
-
-    if not result:
-        logger.warning("No content was extracted from any update!")
-
-    return {"result": result}
+    response = app_workflow.invoke(inputs)
+    message = response.get("messages", [])
+    lines = [
+        f"{getattr(m, 'name', 'assistant')}: {m.content}"
+        for m in message
+    ]
+    # Join with actual newline characters
+    return "\n".join(lines)
 
 if __name__ == "__main__":
     import uvicorn

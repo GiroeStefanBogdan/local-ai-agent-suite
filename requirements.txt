@@ -1,8 +1,8 @@
-chainlit
 fastapi
-uvicorn
-langgraph
-openai
-google-api-python-client
+uvicorn[standard]
+pydantic
 python-dotenv
-langchain
+requests
+langchain-openai
+langgraph
+langgraph_supervisor

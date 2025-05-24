@@ -21,8 +21,8 @@ async def handle_message(message: cl.Message):
             await cl.Message(content="⚠️ Error contacting backend.").send()
             return
 
-        data = resp.json()
-        await cl.Message(content=data.get("result", "[no result]")).send()
+        text = resp.text()
+        await cl.Message(content=text).send()
 
 
 
